@@ -1,0 +1,236 @@
+#!/bin/sh
+
+
+# Document Search CLI Wrapper
+# This script translates CLI commands to HTTP API calls
+
+DEFAULT_HOST="localhost"
+DEFAULT_PORT="8080"
+DEFAULT_MAX_RESULTS="5"
+DEFAULT_THRESHOLD="0.7"
+
+# Override defaults with environment variables if set
+HOST=${DOCSEARCH_HOST:-$DEFAULT_HOST}
+PORT=${DOCSEARCH_PORT:-$DEFAULT_PORT}
+BASE_URL="http://${HOST}:${PORT}"
+
+show_usage() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  -i, --index <directory>          Index documents in directory"
+    echo "  -s, --search <query>             Search for documents"
+    echo "  -a, --add <content>              Add document content to index"
+    echo "  -t, --test                       Run simple test"
+    echo "  --max-results <n>                Maximum results to return (default: $DEFAULT_MAX_RESULTS)"
+    echo "  --similarity-threshold <t>       Minimum similarity threshold (default: $DEFAULT_THRESHOLD)"
+    echo "  --index-path <path>              Directory to save added documents"
+    echo "  --host <host>                    Server host (default: $DEFAULT_HOST)"
+    echo "  --port <port>                    Server port (default: $DEFAULT_PORT)"
+    echo "  -h, --help                       Show this help message"
+    echo ""
+    echo "Environment Variables:"
+    echo "  DOCSEARCH_HOST                   Override default host"
+    echo "  DOCSEARCH_PORT                   Override default port"
+}
+
+check_server() {
+    if ! curl -s "${BASE_URL}/health" > /dev/null 2>&1; then
+        echo "Error: Document search server is not running at ${BASE_URL}"
+        echo "Please start the server first with: python3 document_search.py --server --host ${HOST} --port ${PORT}"
+        exit 1
+    fi
+}
+
+# Parse command line arguments
+ACTION=""
+QUERY=""
+DIRECTORY=""
+CONTENT=""
+MAX_RESULTS="$DEFAULT_MAX_RESULTS"
+THRESHOLD="$DEFAULT_THRESHOLD"
+INDEX_PATH=""
+RUN_TEST=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -i|--index)
+            ACTION="index"
+            DIRECTORY="$2"
+            shift 2
+            ;;
+        -s|--search)
+            ACTION="search"
+            QUERY="$2"
+            shift 2
+            ;;
+        -a|--add)
+            ACTION="add"
+            CONTENT="$2"
+            shift 2
+            ;;
+        -t|--test)
+            ACTION="test"
+            RUN_TEST=true
+            shift
+            ;;
+        --max-results)
+            MAX_RESULTS="$2"
+            shift 2
+            ;;
+        --similarity-threshold)
+            THRESHOLD="$2"
+            shift 2
+            ;;
+        --index-path)
+            INDEX_PATH="$2"
+            shift 2
+            ;;
+        --host)
+            HOST="$2"
+            BASE_URL="http://${HOST}:${PORT}"
+            shift 2
+            ;;
+        --port)
+            PORT="$2"
+            BASE_URL="http://${HOST}:${PORT}"
+            shift 2
+            ;;
+        -h|--help)
+            show_usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_usage
+            exit 1
+            ;;
+    esac
+done
+
+# Check if server is running
+check_server
+
+# Execute the appropriate action
+case $ACTION in
+    "search")
+        if [[ -z "$QUERY" ]]; then
+            echo "Error: Search query is required"
+            exit 1
+        fi
+        
+        echo "Searching for: $QUERY"
+        URL="${BASE_URL}/search?q=$(printf '%s' "$QUERY" | jq -sRr @uri)&max_results=${MAX_RESULTS}&threshold=${THRESHOLD}"
+        
+        RESPONSE=$(curl -s "$URL")
+        if [[ $? -eq 0 ]]; then
+            echo "$RESPONSE" | jq -r '
+                if .error then
+                    "Error: " + .error
+                elif .results > 0 then
+                    "Found " + (.results | tostring) + " matching documents:\n" +
+                    (.documents | to_entries[] | "\(.key + 1). \(.value.metadata.filename) (similarity: \(.value.similarity | . * 100 | round / 100))")
+                    + (if .merged_content then "\n\n" + "="*80 + "\nMERGED SEARCH RESULTS\n" + "="*80 + "\n" + .merged_content else "" end)
+                else
+                    "No matching documents found."
+                end
+            '
+        else
+            echo "Error: Failed to connect to server"
+            exit 1
+        fi
+        ;;
+        
+    "index")
+        if [[ -z "$DIRECTORY" ]]; then
+            echo "Error: Directory path is required"
+            exit 1
+        fi
+        
+        if [[ ! -d "$DIRECTORY" ]]; then
+            echo "Error: Directory '$DIRECTORY' does not exist"
+            exit 1
+        fi
+        
+        echo "Indexing documents in: $DIRECTORY"
+        
+        RESPONSE=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "{\"directory\": \"$DIRECTORY\"}" \
+            "${BASE_URL}/index")
+            
+        if [[ $? -eq 0 ]]; then
+            echo "$RESPONSE" | jq -r '
+                if .error then
+                    "Error: " + .error
+                else
+                    .message
+                end
+            '
+        else
+            echo "Error: Failed to connect to server"
+            exit 1
+        fi
+        ;;
+        
+    "add")
+        if [[ -z "$CONTENT" ]]; then
+            echo "Error: Content is required"
+            exit 1
+        fi
+        
+        echo "Adding document content to index..."
+        
+        JSON_PAYLOAD="{\"content\": $(printf '%s' "$CONTENT" | jq -Rs .)}"
+        if [[ -n "$INDEX_PATH" ]]; then
+            JSON_PAYLOAD="{\"content\": $(printf '%s' "$CONTENT" | jq -Rs .), \"index_path\": \"$INDEX_PATH\"}"
+        fi
+        
+        RESPONSE=$(curl -s -X POST \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD" \
+            "${BASE_URL}/add")
+            
+        if [[ $? -eq 0 ]]; then
+            echo "$RESPONSE" | jq -r '
+                if .error then
+                    "Error: " + .error
+                else
+                    .message
+                end
+            '
+        else
+            echo "Error: Failed to connect to server"
+            exit 1
+        fi
+        ;;
+        
+    "test")
+        echo "Running simple test..."
+        
+        URL="${BASE_URL}/test"
+        if [[ -n "$INDEX_PATH" ]]; then
+            URL="${URL}?index_path=$(printf '%s' "$INDEX_PATH" | jq -sRr @uri)"
+        fi
+        
+        RESPONSE=$(curl -s "$URL")
+        if [[ $? -eq 0 ]]; then
+            echo "$RESPONSE" | jq -r '
+                if .error then
+                    "Error: " + .error
+                else
+                    .message
+                end
+            '
+        else
+            echo "Error: Failed to connect to server"
+            exit 1
+        fi
+        ;;
+        
+    "")
+        echo "Error: No action specified"
+        show_usage
+        exit 1
+        ;;
+esac
