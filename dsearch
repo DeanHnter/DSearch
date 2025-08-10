@@ -1,236 +1,167 @@
-#!/bin/sh
+#!/usr/bin/env bash
+# -------------------------------------------
+# Document-Search – simple Bash CLI wrapper
+# -------------------------------------------
 
-
-# Document Search CLI Wrapper
-# This script translates CLI commands to HTTP API calls
-
+# Defaults – can be overridden with environment variables
 DEFAULT_HOST="localhost"
 DEFAULT_PORT="8080"
 DEFAULT_MAX_RESULTS="5"
 DEFAULT_THRESHOLD="0.7"
 
-# Override defaults with environment variables if set
 HOST=${DOCSEARCH_HOST:-$DEFAULT_HOST}
 PORT=${DOCSEARCH_PORT:-$DEFAULT_PORT}
 BASE_URL="http://${HOST}:${PORT}"
 
 show_usage() {
-    echo "Usage: $0 [OPTIONS]"
-    echo ""
-    echo "Options:"
-    echo "  -i, --index <directory>          Index documents in directory"
-    echo "  -s, --search <query>             Search for documents"
-    echo "  -a, --add <content>              Add document content to index"
-    echo "  -t, --test                       Run simple test"
-    echo "  --max-results <n>                Maximum results to return (default: $DEFAULT_MAX_RESULTS)"
-    echo "  --similarity-threshold <t>       Minimum similarity threshold (default: $DEFAULT_THRESHOLD)"
-    echo "  --index-path <path>              Directory to save added documents"
-    echo "  --host <host>                    Server host (default: $DEFAULT_HOST)"
-    echo "  --port <port>                    Server port (default: $DEFAULT_PORT)"
-    echo "  -h, --help                       Show this help message"
-    echo ""
-    echo "Environment Variables:"
-    echo "  DOCSEARCH_HOST                   Override default host"
-    echo "  DOCSEARCH_PORT                   Override default port"
+cat <<EOF
+Usage: $0 [OPTIONS]
+
+Actions
+  -i, --index  <directory>     Recursively index all files in directory
+  -s, --search <query>         Search the index
+  -a, --add    <string>        Add a single piece of text to the index
+  -t, --test                   Run built-in self-test of the server
+
+Options
+  --max-results <n>            Number of results to return   (def. $DEFAULT_MAX_RESULTS)
+  --similarity-threshold <t>   Similarity threshold          (def. $DEFAULT_THRESHOLD)
+  --index-path <path>          Where “add” stores the file   (server side)
+  --title <text>               Title used by “add”
+  --host <host>                Server host                   (def. $DEFAULT_HOST)
+  --port <port>                Server port                   (def. $DEFAULT_PORT)
+  -h, --help                   This help
+
+Environment
+  DOCSEARCH_HOST / DOCSEARCH_PORT – same as --host / --port
+EOF
 }
 
+#----------------------------------------------------------
+# helpers
+#----------------------------------------------------------
 check_server() {
-    if ! curl -s "${BASE_URL}/health" > /dev/null 2>&1; then
-        echo "Error: Document search server is not running at ${BASE_URL}"
-        echo "Please start the server first with: python3 document_search.py --server --host ${HOST} --port ${PORT}"
+    curl -fs "${BASE_URL}/health" >/dev/null 2>&1 || {
+        echo "Error: server not reachable at ${BASE_URL}"
+        echo "Start it with:  python3 document_search.py server --host ${HOST} --port ${PORT}"
         exit 1
-    fi
+    }
 }
 
-# Parse command line arguments
+# poor man’s url-encoder (enough for query strings)
+url_encode() {
+    local out=""
+    local LC_ALL=C
+    for ((i=0;i<${#1};i++)); do
+        c=${1:i:1}
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) printf -v out '%s%%%02X' "$out" "'$c"
+        esac
+    done
+    echo "$out"
+}
+
+# escape \ " newlines … for JSON bodies we *generate* here
+json_escape() {
+    local s=${1//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/}
+    echo "$s"
+}
+
+parse_json_field() {
+    # very small “parser” – works for   "field":"value"   or   "field":123
+    echo "$1" | sed -nE 's/.*"'$2'"[[:space:]]*:[[:space:]]*"?([^",}]*)"?[[:space:]]*.*/\1/p' | head -1
+}
+
+has_error() {
+    grep -q '"error"' <<<"$1"
+}
+
+#----------------------------------------------------------
+# argument handling
+#----------------------------------------------------------
 ACTION=""
 QUERY=""
-DIRECTORY=""
+DIR=""
 CONTENT=""
-MAX_RESULTS="$DEFAULT_MAX_RESULTS"
-THRESHOLD="$DEFAULT_THRESHOLD"
+MAX_RESULTS=$DEFAULT_MAX_RESULTS
+THRESHOLD=$DEFAULT_THRESHOLD
 INDEX_PATH=""
-RUN_TEST=false
+TITLE=""
 
 while [[ $# -gt 0 ]]; do
-    case $1 in
-        -i|--index)
-            ACTION="index"
-            DIRECTORY="$2"
-            shift 2
-            ;;
-        -s|--search)
-            ACTION="search"
-            QUERY="$2"
-            shift 2
-            ;;
-        -a|--add)
-            ACTION="add"
-            CONTENT="$2"
-            shift 2
-            ;;
-        -t|--test)
-            ACTION="test"
-            RUN_TEST=true
-            shift
-            ;;
-        --max-results)
-            MAX_RESULTS="$2"
-            shift 2
-            ;;
-        --similarity-threshold)
-            THRESHOLD="$2"
-            shift 2
-            ;;
-        --index-path)
-            INDEX_PATH="$2"
-            shift 2
-            ;;
-        --host)
-            HOST="$2"
-            BASE_URL="http://${HOST}:${PORT}"
-            shift 2
-            ;;
-        --port)
-            PORT="$2"
-            BASE_URL="http://${HOST}:${PORT}"
-            shift 2
-            ;;
-        -h|--help)
-            show_usage
-            exit 0
-            ;;
-        *)
-            echo "Unknown option: $1"
-            show_usage
-            exit 1
-            ;;
+    case "$1" in
+        -i|--index)  ACTION=index ; DIR=$2   ; shift 2 ;;
+        -s|--search) ACTION=search; QUERY=$2 ; shift 2 ;;
+        -a|--add)    ACTION=add   ; CONTENT=$2;shift 2 ;;
+        -t|--test)   ACTION=test  ; shift    ;;
+        --max-results)           MAX_RESULTS=$2 ; shift 2 ;;
+        --similarity-threshold)  THRESHOLD=$2   ; shift 2 ;;
+        --index-path)            INDEX_PATH=$2  ; shift 2 ;;
+        --title)                 TITLE=$2       ; shift 2 ;;
+        --host)   HOST=$2 ; BASE_URL="http://$HOST:$PORT"; shift 2 ;;
+        --port)   PORT=$2 ; BASE_URL="http://$HOST:$PORT"; shift 2 ;;
+        -h|--help) show_usage; exit 0 ;;
+        *) echo "Unknown option $1"; show_usage; exit 1 ;;
     esac
 done
 
-# Check if server is running
+[[ -z $ACTION ]] && { echo "Error: no action given"; show_usage; exit 1; }
+
 check_server
 
-# Execute the appropriate action
+#----------------------------------------------------------
+# actions
+#----------------------------------------------------------
 case $ACTION in
-    "search")
-        if [[ -z "$QUERY" ]]; then
-            echo "Error: Search query is required"
-            exit 1
-        fi
-        
-        echo "Searching for: $QUERY"
-        URL="${BASE_URL}/search?q=$(printf '%s' "$QUERY" | jq -sRr @uri)&max_results=${MAX_RESULTS}&threshold=${THRESHOLD}"
-        
-        RESPONSE=$(curl -s "$URL")
-        if [[ $? -eq 0 ]]; then
-            echo "$RESPONSE" | jq -r '
-                if .error then
-                    "Error: " + .error
-                elif .results > 0 then
-                    "Found " + (.results | tostring) + " matching documents:\n" +
-                    (.documents | to_entries[] | "\(.key + 1). \(.value.metadata.filename) (similarity: \(.value.similarity | . * 100 | round / 100))")
-                    + (if .merged_content then "\n\n" + "="*80 + "\nMERGED SEARCH RESULTS\n" + "="*80 + "\n" + .merged_content else "" end)
-                else
-                    "No matching documents found."
-                end
-            '
-        else
-            echo "Error: Failed to connect to server"
-            exit 1
-        fi
-        ;;
-        
-    "index")
-        if [[ -z "$DIRECTORY" ]]; then
-            echo "Error: Directory path is required"
-            exit 1
-        fi
-        
-        if [[ ! -d "$DIRECTORY" ]]; then
-            echo "Error: Directory '$DIRECTORY' does not exist"
-            exit 1
-        fi
-        
-        echo "Indexing documents in: $DIRECTORY"
-        
-        RESPONSE=$(curl -s -X POST \
-            -H "Content-Type: application/json" \
-            -d "{\"directory\": \"$DIRECTORY\"}" \
-            "${BASE_URL}/index")
-            
-        if [[ $? -eq 0 ]]; then
-            echo "$RESPONSE" | jq -r '
-                if .error then
-                    "Error: " + .error
-                else
-                    .message
-                end
-            '
-        else
-            echo "Error: Failed to connect to server"
-            exit 1
-        fi
-        ;;
-        
-    "add")
-        if [[ -z "$CONTENT" ]]; then
-            echo "Error: Content is required"
-            exit 1
-        fi
-        
-        echo "Adding document content to index..."
-        
-        JSON_PAYLOAD="{\"content\": $(printf '%s' "$CONTENT" | jq -Rs .)}"
-        if [[ -n "$INDEX_PATH" ]]; then
-            JSON_PAYLOAD="{\"content\": $(printf '%s' "$CONTENT" | jq -Rs .), \"index_path\": \"$INDEX_PATH\"}"
-        fi
-        
-        RESPONSE=$(curl -s -X POST \
-            -H "Content-Type: application/json" \
-            -d "$JSON_PAYLOAD" \
-            "${BASE_URL}/add")
-            
-        if [[ $? -eq 0 ]]; then
-            echo "$RESPONSE" | jq -r '
-                if .error then
-                    "Error: " + .error
-                else
-                    .message
-                end
-            '
-        else
-            echo "Error: Failed to connect to server"
-            exit 1
-        fi
-        ;;
-        
-    "test")
-        echo "Running simple test..."
-        
-        URL="${BASE_URL}/test"
-        if [[ -n "$INDEX_PATH" ]]; then
-            URL="${URL}?index_path=$(printf '%s' "$INDEX_PATH" | jq -sRr @uri)"
-        fi
-        
-        RESPONSE=$(curl -s "$URL")
-        if [[ $? -eq 0 ]]; then
-            echo "$RESPONSE" | jq -r '
-                if .error then
-                    "Error: " + .error
-                else
-                    .message
-                end
-            '
-        else
-            echo "Error: Failed to connect to server"
-            exit 1
-        fi
-        ;;
-        
-    "")
-        echo "Error: No action specified"
-        show_usage
-        exit 1
-        ;;
+# --------------------------- search
+search)
+    [[ -z $QUERY ]] && { echo "Error: search needs a query"; exit 1; }
+    echo "Searching for: $QUERY"
+    enc=$(url_encode "$QUERY")
+    curl -fs "${BASE_URL}/search?q=${enc}&max_results=${MAX_RESULTS}&threshold=${THRESHOLD}&format=text"
+    exit $?
+;;
+# --------------------------- index
+index)
+    [[ -z $DIR   ]] && { echo "Error: give directory"; exit 1; }
+    [[ -d $DIR   ]] || { echo "Error: '$DIR' not a directory"; exit 1; }
+    payload='{"directory":"'"$(json_escape "$DIR")"'"}'
+    resp=$(curl -fs -X POST -H "Content-Type: application/json" -d "$payload" "${BASE_URL}/index") || {
+        echo "HTTP error"; exit 1; }
+    if has_error "$resp"; then
+        echo "Error: $(parse_json_field "$resp" error)"
+    else
+        echo "$(parse_json_field "$resp" message)"
+    fi
+;;
+# --------------------------- add
+add)
+    [[ -z $CONTENT ]] && { echo "Error: give content"; exit 1; }
+    json='{"content":"'"$(json_escape "$CONTENT")"'"'
+    [[ -n $INDEX_PATH ]] && json+=',"index_path":"'"$(json_escape "$INDEX_PATH")"'"'
+    [[ -n $TITLE      ]] && json+=',"title":"'"$(json_escape "$TITLE")"'"'
+    json+='}'
+    resp=$(curl -fs -X POST -H "Content-Type: application/json" -d "$json" "${BASE_URL}/add") || {
+        echo "HTTP error"; exit 1; }
+    if has_error "$resp"; then
+        echo "Error: $(parse_json_field "$resp" error)"
+    else
+        echo "$(parse_json_field "$resp" message)"
+    fi
+;;
+# --------------------------- test
+test)
+    url="${BASE_URL}/test"
+    [[ -n $INDEX_PATH ]] && url+="?index_path=$(url_encode "$INDEX_PATH")"
+    resp=$(curl -fs "$url") || { echo "HTTP error"; exit 1; }
+    if has_error "$resp"; then
+        echo "Error: $(parse_json_field "$resp" error)"
+    else
+        echo "$(parse_json_field "$resp" message)"
+    fi
+;;
 esac
