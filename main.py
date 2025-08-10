@@ -48,6 +48,139 @@ programming_stop_words = {
     'shall', 'should', 'ought'
 }
 
+def normalize_programming_operators(text: str) -> str:
+    """Convert programming operators and symbols to natural language equivalents"""
+    # Define operator mappings
+    operator_mappings = {
+        # Comparison operators
+        '==': ' equals ',
+        '!=': ' not equals ',
+        '!==': ' not strictly equals ',
+        '===': ' strictly equals ',
+        '<=': ' less than or equal to ',
+        '>=': ' greater than or equal to ',
+        '<': ' less than ',
+        '>': ' greater than ',
+        
+        # Logical operators
+        '&&': ' and ',
+        '||': ' or ',
+        '!': ' not ',
+        
+        # Assignment operators
+        '+=': ' plus equals ',
+        '-=': ' minus equals ',
+        '*=': ' multiply equals ',
+        '/=': ' divide equals ',
+        '%=': ' modulo equals ',
+        '=': ' assign ',
+        
+        # Arithmetic operators
+        '++': ' increment ',
+        '--': ' decrement ',
+        '+': ' plus ',
+        '-': ' minus ',
+        '*': ' multiply ',
+        '/': ' divide ',
+        '%': ' modulo ',
+        '**': ' power ',
+        
+        # Bitwise operators
+        '&': ' bitwise and ',
+        '|': ' bitwise or ',
+        '^': ' bitwise xor ',
+        '~': ' bitwise not ',
+        '<<': ' left shift ',
+        '>>': ' right shift ',
+        
+        # Arrow functions and pointers
+        '=>': ' arrow function ',
+        '->': ' arrow pointer ',
+        '::': ' scope resolution ',
+        
+        # Brackets and delimiters
+        '{': ' open brace ',
+        '}': ' close brace ',
+        '[': ' open bracket ',
+        ']': ' close bracket ',
+        '(': ' open paren ',
+        ')': ' close paren ',
+        
+        # Special symbols
+        ';': ' semicolon ',
+        ':': ' colon ',
+        ',': ' comma ',
+        '.': ' dot ',
+        '?': ' question mark ',
+        '#': ' hash ',
+        '@': ' at symbol ',
+        '$': ' dollar ',
+        
+        # Common programming patterns
+        '...': ' spread operator ',
+        '?.': ' optional chaining ',
+        '??': ' nullish coalescing ',
+    }
+    
+    # Sort by length (longest first) to avoid partial replacements
+    sorted_operators = sorted(operator_mappings.items(), key=lambda x: len(x[0]), reverse=True)
+    
+    result = text
+    for operator, replacement in sorted_operators:
+        # Use word boundaries where appropriate to avoid over-replacement
+        if operator.isalnum():
+            pattern = r'\b' + re.escape(operator) + r'\b'
+        else:
+            pattern = re.escape(operator)
+        result = re.sub(pattern, replacement, result)
+    
+    return result
+
+def separate_symbols_from_words(text: str) -> str:
+    """Separate symbols from words to improve exact matching"""
+    # First handle markdown-style formatting
+    text = re.sub(r'\*\*([^*]+)\*\*', r'** \1 **', text)  # **word** -> ** word **
+    text = re.sub(r'\*([^*]+)\*', r'* \1 *', text)        # *word* -> * word *
+    text = re.sub(r'`([^`]+)`', r'` \1 `', text)          # `word` -> ` word `
+    text = re.sub(r'_([^_]+)_', r'_ \1 _', text)          # _word_ -> _ word _
+    
+    # Handle common programming symbols attached to words
+    # Function calls: word( -> word (
+    text = re.sub(r'(\w)(\()', r'\1 \2', text)
+    # Array access: word[ -> word [
+    text = re.sub(r'(\w)(\[)', r'\1 \2', text)
+    # Object access: word. -> word .
+    text = re.sub(r'(\w)(\.)', r'\1 \2', text)
+    # Closing brackets: )word -> ) word
+    text = re.sub(r'(\))(\w)', r'\1 \2', text)
+    text = re.sub(r'(\])(\w)', r'\1 \2', text)
+    text = re.sub(r'(\})(\w)', r'\1 \2', text)
+    
+    # Handle operators attached to words
+    # word= -> word =
+    text = re.sub(r'(\w)(=)', r'\1 \2', text)
+    # word+ -> word +
+    text = re.sub(r'(\w)([+\-*/%])', r'\1 \2', text)
+    # =word -> = word
+    text = re.sub(r'([=+\-*/%])(\w)', r'\1 \2', text)
+    
+    # Handle comparison operators
+    text = re.sub(r'(\w)([<>!]=?)', r'\1 \2', text)
+    text = re.sub(r'([<>!]=?)(\w)', r'\1 \2', text)
+    
+    # Handle semicolons and commas
+    text = re.sub(r'(\w)([;,])', r'\1 \2', text)
+    text = re.sub(r'([;,])(\w)', r'\1 \2', text)
+    
+    # Handle colons (but be careful with :: and URLs)
+    text = re.sub(r'(\w)(:)(?!:)', r'\1 \2', text)
+    text = re.sub(r'(?<!:)(:)(\w)', r'\1 \2', text)
+    
+    # Clean up multiple spaces
+    text = re.sub(r'\s+', ' ', text)
+    
+    return text.strip()
+
 def normalize_word(word: str) -> Set[str]:
     """Generate all normalized forms of a word (stem, lemma, plural/singular)"""
     if not word or len(word) < 2:
@@ -166,7 +299,8 @@ def extract_key_concepts(text: str) -> Set[str]:
         'generic', 'generics', 'template', 'templates', 'namespace', 'namespaces',
         'parameter', 'parameters', 'argument', 'arguments', 'return', 'returns',
         'create', 'creating', 'creation', 'define', 'defining', 'definition',
-        'declare', 'declaring', 'declaration', 'initialize', 'initializing', 'initialization'
+        'declare', 'declaring', 'declaration', 'initialize', 'initializing', 'initialization',
+        'equals', 'assign', 'compare', 'comparison', 'condition', 'conditional'
     }
     
     # Extract words from text with morphological normalization
@@ -187,7 +321,8 @@ def extract_key_concepts(text: str) -> Set[str]:
         r'\bclass\s+\w+', r'\bstruct\s+\w+', r'\bfunction\s+\w+',
         r'\bdef\s+\w+', r'\binterface\s+\w+', r'\benum\s+\w+',
         r'\btype\s+\w+', r'\bvar\s+\w+', r'\blet\s+\w+', r'\bconst\s+\w+',
-        r'\bcreating\s+\w+', r'\bdefining\s+\w+', r'\bdeclaring\s+\w+'
+        r'\bcreating\s+\w+', r'\bdefining\s+\w+', r'\bdeclaring\s+\w+',
+        r'\bequals\s+\w+', r'\bassign\s+\w+', r'\bcompare\s+\w+'
     ]
     
     for pattern in concept_patterns:
@@ -198,6 +333,105 @@ def extract_key_concepts(text: str) -> Set[str]:
             found_concepts.update(words_in_match)
     
     return found_concepts
+
+# ────────────────────────────────────────────────────────────
+# BM25 Implementation
+# ────────────────────────────────────────────────────────────
+
+class BM25:
+    """BM25 scoring implementation for lexical matching"""
+    
+    def __init__(self, k1: float = 1.5, b: float = 0.75):
+        self.k1 = k1  # Term frequency saturation parameter
+        self.b = b    # Length normalization parameter
+        self.corpus = []
+        self.doc_freqs = []
+        self.idf = {}
+        self.doc_len = []
+        self.avgdl = 0
+        self.N = 0
+        
+    def fit(self, corpus: List[str]):
+        """Fit BM25 on a corpus of documents"""
+        self.corpus = corpus
+        self.N = len(corpus)
+        
+        # Tokenize and process documents
+        self.doc_freqs = []
+        self.doc_len = []
+        
+        # Count document frequencies for IDF calculation
+        df = defaultdict(int)
+        
+        for doc in corpus:
+            # Tokenize document
+            tokens = self._tokenize(doc)
+            self.doc_len.append(len(tokens))
+            
+            # Count term frequencies in this document
+            doc_freq = defaultdict(int)
+            for token in tokens:
+                doc_freq[token] += 1
+            
+            self.doc_freqs.append(doc_freq)
+            
+            # Count document frequency for each unique term
+            for token in set(tokens):
+                df[token] += 1
+        
+        # Calculate average document length
+        self.avgdl = sum(self.doc_len) / len(self.doc_len) if self.doc_len else 0
+        
+        # Calculate IDF for each term
+        self.idf = {}
+        for term, freq in df.items():
+            self.idf[term] = math.log((self.N - freq + 0.5) / (freq + 0.5))
+    
+    def _tokenize(self, text: str) -> List[str]:
+        """Tokenize text for BM25 scoring"""
+        # Convert to lowercase and extract words
+        words = re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', text.lower())
+        
+        # Filter out stop words but keep programming terms
+        filtered_words = []
+        for word in words:
+            if word not in programming_stop_words or len(word) <= 2:
+                filtered_words.append(word)
+        
+        return filtered_words
+    
+    def score(self, query: str, doc_idx: int) -> float:
+        """Calculate BM25 score for a query against a specific document"""
+        if doc_idx >= len(self.doc_freqs):
+            return 0.0
+        
+        query_tokens = self._tokenize(query)
+        doc_freq = self.doc_freqs[doc_idx]
+        doc_len = self.doc_len[doc_idx]
+        
+        score = 0.0
+        for token in query_tokens:
+            if token in doc_freq:
+                # Term frequency in document
+                tf = doc_freq[token]
+                
+                # IDF for this term
+                idf = self.idf.get(token, 0)
+                
+                # BM25 formula
+                numerator = tf * (self.k1 + 1)
+                denominator = tf + self.k1 * (1 - self.b + self.b * (doc_len / self.avgdl))
+                
+                score += idf * (numerator / denominator)
+        
+        return score
+    
+    def get_scores(self, query: str) -> List[float]:
+        """Get BM25 scores for a query against all documents"""
+        scores = []
+        for i in range(len(self.corpus)):
+            scores.append(self.score(query, i))
+        return scores
 
 def calculate_morphological_similarity(query_words: List[str], content_words: List[str]) -> float:
     """Calculate similarity considering morphological variations"""
@@ -282,7 +516,8 @@ def extract_topic_keywords(text: str) -> Dict[str, float]:
         'function', 'functions', 'method', 'methods', 'variable', 'variables',
         'array', 'arrays', 'struct', 'structs', 'interface', 'interfaces',
         'type', 'types', 'callback', 'callbacks', 'event', 'events',
-        'create', 'creating', 'define', 'defining', 'declare', 'declaring'
+        'create', 'creating', 'define', 'defining', 'declare', 'declaring',
+        'equals', 'assign', 'compare', 'comparison'
     }
     
     for word, freq in normalized_word_freq.items():
@@ -382,7 +617,9 @@ def calculate_semantic_distance(query: str, content: str) -> float:
         'control_flow': {'loop', 'loops', 'condition', 'conditions', 'if', 'else', 'while', 'for',
                         'switch', 'case', 'break', 'continue', 'return', 'yield'},
         'memory': {'pointer', 'pointers', 'reference', 'references', 'memory', 'allocation',
-                  'garbage', 'collection', 'stack', 'heap', 'buffer', 'address'}
+                  'garbage', 'collection', 'stack', 'heap', 'buffer', 'address'},
+        'operators': {'equals', 'assign', 'compare', 'comparison', 'condition', 'conditional',
+                     'plus', 'minus', 'multiply', 'divide', 'modulo', 'increment', 'decrement'}
     }
     
     # Find which topics are present in query and content with morphological matching
@@ -433,42 +670,53 @@ def calculate_semantic_distance(query: str, content: str) -> float:
     
     return topic_overlap
 
-class MorphologicalSimilarity:
-    """Advanced similarity calculator with morphological awareness"""
+class BM25EnhancedSimilarity:
+    """Advanced similarity calculator with BM25, symbol-awareness, and morphological matching"""
     
     def __init__(self):
         self.weights = {
-            'embedding': 0.15,      # Reduced weight for embedding similarity
-            'topic_relevance': 0.40, # Increased weight for topic relevance
-            'semantic_distance': 0.25, # Semantic topic distance
-            'morphological_match': 0.15, # Morphological word matching
-            'exact_matches': 0.05   # Reduced weight for exact matches
+            'embedding': 0.12,      # Reduced weight for embedding similarity
+            'bm25': 0.18,           # BM25 lexical matching
+            'topic_relevance': 0.35, # Topic relevance (highest weight)
+            'semantic_distance': 0.20, # Semantic topic distance
+            'morphological_match': 0.10, # Morphological word matching
+            'exact_matches': 0.05   # Exact matches (lowest weight)
         }
+        self.bm25 = None
     
-    def calculate_similarity(self, query: str, content: str, embedding_similarity: float) -> Dict[str, float]:
-        """Calculate morphologically-aware similarity score"""
+    def set_bm25(self, bm25: BM25):
+        """Set the BM25 instance for scoring"""
+        self.bm25 = bm25
+    
+    def calculate_similarity(self, query: str, content: str, embedding_similarity: float, 
+                           bm25_score: float = 0.0) -> Dict[str, float]:
+        """Calculate comprehensive similarity score including BM25"""
         query_lower = query.lower().strip()
         content_lower = content.lower().strip()
         
         if not query_lower or not content_lower:
-            return {'final_score': 0.0, 'embedding': embedding_similarity, 'topic_relevance': 0.0,
-                   'semantic_distance': 0.0, 'morphological_match': 0.0, 'exact_matches': 0.0}
+            return {'final_score': 0.0, 'embedding': embedding_similarity, 'bm25': bm25_score,
+                   'topic_relevance': 0.0, 'semantic_distance': 0.0, 'morphological_match': 0.0, 
+                   'exact_matches': 0.0}
         
         scores = {}
         
-        # 1. Embedding similarity (reduced weight)
+        # 1. Embedding similarity
         scores['embedding'] = embedding_similarity
         
-        # 2. Topic relevance (high weight, morphologically aware)
+        # 2. BM25 lexical matching (normalized to 0-1 range)
+        scores['bm25'] = min(bm25_score / 10.0, 1.0) if bm25_score > 0 else 0.0
+        
+        # 3. Topic relevance (high weight, morphologically aware)
         scores['topic_relevance'] = calculate_topic_relevance(query, content)
         
-        # 3. Semantic distance (topic clustering with morphological matching)
+        # 4. Semantic distance (topic clustering with morphological matching)
         scores['semantic_distance'] = calculate_semantic_distance(query, content)
         
-        # 4. Morphological matching
+        # 5. Morphological matching
         scores['morphological_match'] = self._calculate_morphological_match(query_lower, content_lower)
         
-        # 5. Exact matches (reduced weight)
+        # 6. Exact matches
         scores['exact_matches'] = self._calculate_exact_matches(query_lower, content_lower)
         
         # Calculate weighted final score
@@ -479,9 +727,9 @@ class MorphologicalSimilarity:
         if scores['topic_relevance'] < 0.1 and scores['semantic_distance'] < 0.2:
             final_score *= 0.2  # Heavy penalty for topic mismatch
         
-        # Boost if morphological matching is strong
-        if scores['morphological_match'] > 0.7:
-            final_score *= 1.2  # Boost for strong morphological matches
+        # Boost if BM25 and morphological matching are both strong
+        if scores['bm25'] > 0.5 and scores['morphological_match'] > 0.7:
+            final_score *= 1.15  # Boost for strong lexical + morphological matches
         
         scores['final_score'] = min(final_score, 1.0)
         
@@ -512,8 +760,52 @@ class MorphologicalSimilarity:
         
         return min(score, 1.0)
 
+def preprocess_text_for_embedding(text: str) -> str:
+    """Enhanced preprocessing specifically for embedding generation with symbol awareness"""
+    if not text:
+        return ""
+    
+    # Step 1: Separate symbols from words for better exact matching
+    text = separate_symbols_from_words(text)
+    
+    # Step 2: Convert programming operators to natural language
+    text = normalize_programming_operators(text)
+    
+    # Step 3: Standard preprocessing
+    # Remove control characters
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', text)
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    
+    # Convert to lowercase for processing
+    text_lower = text.lower()
+    
+    # Tokenize
+    try:
+        tokens = word_tokenize(text_lower)
+    except Exception:
+        tokens = text_lower.split()
+    
+    # Process tokens with morphological awareness
+    processed_tokens = []
+    
+    # Keep original tokens for exact matching
+    for token in tokens:
+        if token and len(token) > 1:
+            processed_tokens.append(token)
+    
+    # Add morphologically normalized versions for important words
+    for token in tokens:
+        if token and len(token) > 2 and token not in programming_stop_words:
+            normalized_forms = normalize_word(token)
+            # Only add the most relevant normalized forms to avoid noise
+            for form in normalized_forms:
+                if not form.startswith('prefix_') and not form.startswith('suffix_'):
+                    processed_tokens.append(form)
+    
+    return ' '.join(processed_tokens)
+
 def preprocess_text(text: str, preserve_original: bool = True) -> str:
-    """Enhanced preprocessing with morphological awareness"""
+    """Standard preprocessing for search operations"""
     if not text:
         return ""
     
@@ -550,20 +842,24 @@ def preprocess_text(text: str, preserve_original: bool = True) -> str:
     return ' '.join(processed_tokens)
 
 def enhanced_query_preprocessing(query: str) -> str:
-    """Query preprocessing with morphological expansion"""
+    """Query preprocessing with symbol awareness and morphological expansion"""
     if not query:
         return ""
     
+    # Step 1: Apply symbol-aware preprocessing to query
+    symbol_processed = separate_symbols_from_words(query)
+    operator_processed = normalize_programming_operators(symbol_processed)
+    
     # Add original query
-    all_processed = [query.lower()]
+    all_processed = [query.lower(), operator_processed.lower()]
     
     # Add morphologically processed version
-    processed = preprocess_text(query, preserve_original=True)
+    processed = preprocess_text(operator_processed, preserve_original=True)
     if processed:
         all_processed.append(processed)
     
     # Add concept-focused expansion with morphological variants
-    concepts = extract_key_concepts(query)
+    concepts = extract_key_concepts(operator_processed)
     for concept in concepts:
         all_processed.append(concept)
         # Add morphological variants
@@ -594,8 +890,11 @@ class DocumentIndexer:
         self.collection = self.client.get_or_create_collection(
             name=collection_name, metadata={"hnsw:space": "cosine"})
         
-        # Initialize morphological similarity calculator
-        self.similarity_calculator = MorphologicalSimilarity()
+        # Initialize BM25-enhanced similarity calculator
+        self.similarity_calculator = BM25EnhancedSimilarity()
+        self.bm25 = None
+        self.bm25_corpus = []
+        self.file_paths = []
         
         # Store or retrieve the indexed directory path
         self.index_path = self._get_or_set_index_path(index_path)
@@ -633,6 +932,40 @@ class DocumentIndexer:
             "size": os.path.getsize(file_path),
             "index_path": index_path
         }
+    
+    def _build_bm25_index(self):
+        """Build BM25 index from current documents"""
+        print("Building BM25 index...")
+        
+        # Get all documents from ChromaDB
+        all_docs = self.collection.get(include=["documents", "metadatas"])
+        
+        if not all_docs["documents"]:
+            print("No documents found for BM25 indexing")
+            return
+        
+        # Prepare corpus for BM25
+        self.bm25_corpus = []
+        self.file_paths = []
+        
+        for i, doc in enumerate(all_docs["documents"]):
+            # Get original content for BM25 (not the preprocessed version)
+            file_path = all_docs["metadatas"][i].get("file_path", "")
+            original_content = self._get_original_content(file_path)
+            
+            if original_content:
+                self.bm25_corpus.append(original_content)
+            else:
+                self.bm25_corpus.append(doc)
+            
+            self.file_paths.append(file_path)
+        
+        # Build BM25 index
+        self.bm25 = BM25()
+        self.bm25.fit(self.bm25_corpus)
+        self.similarity_calculator.set_bm25(self.bm25)
+        
+        print(f"BM25 index built with {len(self.bm25_corpus)} documents")
     
     def sync_with_filesystem(self):
         """Sync the database with the filesystem, checking for changes"""
@@ -677,6 +1010,9 @@ class DocumentIndexer:
                 print(f"Re-indexing modified file: {file_path}")
                 self._remove_document_by_path(file_path)
                 self._add_files_to_collection([file_path])
+        
+        # Rebuild BM25 index after sync
+        self._build_bm25_index()
     
     def _remove_document_by_path(self, file_path: str):
         """Remove a document from the collection by file path"""
@@ -721,24 +1057,24 @@ class DocumentIndexer:
             self.collection.add(documents=documents, metadatas=metadatas, ids=ids)
 
     def _clean_content(self, content: str) -> str:
-        """Morphologically-aware content cleaning"""
+        """Symbol-aware content cleaning for embedding generation"""
         # Remove control characters
         content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', content)
         content = content.replace('\r\n', '\n').replace('\r', '\n')
         cleaned = content.strip()
         
-        # Create morphologically-aware representations
+        # Create symbol-aware representations
         representations = []
         
         # 1. Original cleaned content (for exact matching)
         representations.append(cleaned)
         
-        # 2. Morphologically processed content
-        preprocessed = preprocess_text(cleaned, preserve_original=True)
-        representations.append(preprocessed)
+        # 2. Symbol-aware preprocessed content (main representation for embedding)
+        symbol_processed = preprocess_text_for_embedding(cleaned)
+        representations.append(symbol_processed)
         
         # 3. Extract and emphasize key concepts with morphological variants
-        concepts = extract_key_concepts(cleaned)
+        concepts = extract_key_concepts(symbol_processed)
         if concepts:
             concept_variants = set()
             for concept in concepts:
@@ -779,6 +1115,9 @@ class DocumentIndexer:
                                 metadatas=metadatas,
                                 ids=ids)
             print("Added", len(documents), "documents")
+            
+            # Build BM25 index after adding documents
+            self._build_bm25_index()
 
     def add_document(self, content: str, title: str | None = None):
         # Use the stored index path instead of a passed directory
@@ -805,27 +1144,34 @@ class DocumentIndexer:
             ids=[str(uuid.uuid4())]
         )
         print("Saved & indexed", path)
+        
+        # Rebuild BM25 index after adding document
+        self._build_bm25_index()
 
     def search(self, query: str, n: int, thr: float) -> List[Dict]:
-        """Morphologically-aware search"""
+        """BM25-enhanced symbol-aware search"""
         if not query.strip():
             return []
         
+        # Ensure BM25 index is built
+        if self.bm25 is None:
+            self._build_bm25_index()
+        
         all_results = []
         
-        # Strategy 1: Morphological query search
+        # Strategy 1: Symbol-aware query search
         try:
-            morphological_query = enhanced_query_preprocessing(query)
+            symbol_query = enhanced_query_preprocessing(query)
             res1 = self.collection.query(
-                query_texts=[morphological_query], 
+                query_texts=[symbol_query], 
                 n_results=min(n * 4, 100),  # Get more results for reranking
                 include=['documents', 'metadatas', 'distances']
             )
             results1 = self._process_search_results(res1, query)
             all_results.extend(results1)
-            print(f"Morphological search: {len(results1)} results")
+            print(f"Symbol-aware search: {len(results1)} results")
         except Exception as e:
-            print(f"Morphological search failed: {e}")
+            print(f"Symbol-aware search failed: {e}")
         
         # Strategy 2: Concept-based search with morphological variants
         query_concepts = extract_key_concepts(query)
@@ -861,14 +1207,14 @@ class DocumentIndexer:
         except Exception as e:
             print(f"Original search failed: {e}")
         
-        # Morphological reranking and deduplication
-        unique_results = self._deduplicate_and_rerank_morphological(all_results, query, thr)
+        # BM25-enhanced reranking and deduplication
+        unique_results = self._deduplicate_and_rerank_bm25_enhanced(all_results, query, thr)
         
         # Apply threshold and limit
         filtered_results = [r for r in unique_results if r['similarity'] >= thr]
         final_results = filtered_results[:n]
         
-        print(f"Final results: {len(final_results)} (after morphological reranking and threshold {thr})")
+        print(f"Final results: {len(final_results)} (after BM25-enhanced reranking and threshold {thr})")
         return final_results
     
     def _process_search_results(self, res, original_query: str) -> List[Dict]:
@@ -895,8 +1241,8 @@ class DocumentIndexer:
         
         return results
     
-    def _deduplicate_and_rerank_morphological(self, results: List[Dict], query: str, threshold: float) -> List[Dict]:
-        """Remove duplicates and rerank using morphological similarity"""
+    def _deduplicate_and_rerank_bm25_enhanced(self, results: List[Dict], query: str, threshold: float) -> List[Dict]:
+        """Remove duplicates and rerank using BM25-enhanced similarity"""
         # Group by file path to remove duplicates
         file_results = {}
         for result in results:
@@ -904,31 +1250,45 @@ class DocumentIndexer:
             if file_path not in file_results or result['embedding_similarity'] > file_results[file_path]['embedding_similarity']:
                 file_results[file_path] = result
         
-        # Calculate morphological similarity for each unique result
-        morphological_results = []
+        # Calculate BM25-enhanced similarity for each unique result
+        bm25_results = []
         for result in file_results.values():
             # Get original content for better similarity calculation
-            original_content = self._get_original_content(result['metadata'].get('file_path', ''))
+            file_path = result['metadata'].get('file_path', '')
+            original_content = self._get_original_content(file_path)
             if not original_content:
-                # Fallback to first context if available
-                contexts = result['document'].get('contexts', [])
-                original_content = contexts[0]['context'] if contexts else ""
+                # Fallback to basic content if available
+                doc_data = result['document']
+                if isinstance(doc_data, dict) and 'file_size' in doc_data:
+                    original_content = ""  # Use empty string as fallback
+                else:
+                    original_content = str(doc_data)
             
-            # Calculate morphological similarity
+            # Calculate BM25 score
+            bm25_score = 0.0
+            if self.bm25 and file_path in self.file_paths:
+                try:
+                    doc_idx = self.file_paths.index(file_path)
+                    bm25_score = self.bm25.score(query, doc_idx)
+                except (ValueError, IndexError):
+                    bm25_score = 0.0
+            
+            # Calculate BM25-enhanced similarity
             similarity_scores = self.similarity_calculator.calculate_similarity(
-                query, original_content, result['embedding_similarity']
+                query, original_content, result['embedding_similarity'], bm25_score
             )
             
-            # Update result with morphological scores
+            # Update result with BM25-enhanced scores
             result['similarity'] = similarity_scores['final_score']
             result['similarity_breakdown'] = similarity_scores
+            result['bm25_score'] = bm25_score
             
-            morphological_results.append(result)
+            bm25_results.append(result)
         
-        # Sort by morphological similarity
-        morphological_results.sort(key=lambda x: x['similarity'], reverse=True)
+        # Sort by BM25-enhanced similarity
+        bm25_results.sort(key=lambda x: x['similarity'], reverse=True)
         
-        return morphological_results
+        return bm25_results
     
     def _get_original_content(self, file_path: str) -> str:
         """Get original file content for similarity calculation"""
@@ -946,7 +1306,7 @@ class DocumentIndexer:
             return ""
     
     def _find_match_positions(self, content: str, query: str) -> List[Dict]:
-        """Find line and column positions of query matches with morphological awareness"""
+        """Find line and column positions of query matches with symbol awareness"""
         matches = []
         lines = content.split('\n')
         
@@ -990,52 +1350,23 @@ class DocumentIndexer:
         return matches[:10]  # Limit to first 10 matches
     
     def _get_context_around_matches(self, content: str, matches: List[Dict], context_words: int = 50) -> List[Dict]:
-        """Get limited context around each match"""
+        """Get match information without buggy preview text"""
         if not matches:
             return []
         
-        lines = content.split('\n')
+        # Just return the match info without preview text
         contexts = []
-        
         for match in matches:
-            line_idx = match['line'] - 1
-            if line_idx >= len(lines):
-                continue
-                
-            # Get the line with the match
-            match_line = lines[line_idx]
-            
-            # Extract words around the match position
-            words_before = match_line[:match['column'] - 1].split()
-            match_word = match['matched_text']
-            words_after = match_line[match['column'] - 1 + len(match_word):].split()
-            
-            # Take context_words/2 before and after
-            half_context = context_words // 2
-            context_before = ' '.join(words_before[-half_context:]) if words_before else ''
-            context_after = ' '.join(words_after[:half_context]) if words_after else ''
-            
-            # Build context string
-            context_parts = []
-            if context_before:
-                context_parts.append(context_before)
-            context_parts.append(f"**{match_word}**")  # Highlight the match
-            if context_after:
-                context_parts.append(context_after)
-            
-            context_text = ' '.join(context_parts).strip()
-            
             contexts.append({
                 'line': match['line'],
                 'column': match['column'],
-                'context': context_text,
                 'match_type': match['match_type']
             })
         
         return contexts
     
     def _get_display_content(self, doc_content: str, file_path: str, query: str = None) -> Dict:
-        """Get limited context with line/column info instead of full content"""
+        """Get match information with line/column details only"""
         if file_path and os.path.exists(file_path):
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as fp:
@@ -1049,25 +1380,20 @@ class DocumentIndexer:
         else:
             content = doc_content
         
-        # If we have a query, find matches and return limited context
+        # If we have a query, find matches and return match info only
         if query:
             matches = self._find_match_positions(content, query)
-            contexts = self._get_context_around_matches(content, matches, context_words=100)
+            contexts = self._get_context_around_matches(content, matches)
             
             return {
-                'contexts': contexts,
+                'matches': contexts,
                 'total_matches': len(matches),
                 'file_size': len(content)
             }
         else:
-            # Fallback: return first 100 words if no query
-            words = content.split()
-            limited_content = ' '.join(words[:100])
-            if len(words) > 100:
-                limited_content += "... [truncated]"
-            
+            # Fallback: return basic info if no query
             return {
-                'contexts': [{'line': 1, 'column': 1, 'context': limited_content, 'match_type': 'fallback'}],
+                'matches': [],
                 'total_matches': 0,
                 'file_size': len(content)
             }
@@ -1081,27 +1407,41 @@ class DocumentIndexer:
             merged.append(f"DOC {i}: {self._abs(r['metadata']['file_path'])} "
                         f"(sim {r['similarity']:.3f})")
             
-            # Show morphological similarity breakdown
+            # Show BM25-enhanced similarity breakdown
             if 'similarity_breakdown' in r:
                 breakdown = r['similarity_breakdown']
-                merged.append(f"  Topic Relevance: {breakdown.get('topic_relevance', 0):.3f}, "
+                merged.append(f"  BM25: {breakdown.get('bm25', 0):.3f}, "
+                            f"Topic Relevance: {breakdown.get('topic_relevance', 0):.3f}, "
                             f"Semantic Distance: {breakdown.get('semantic_distance', 0):.3f}, "
                             f"Morphological: {breakdown.get('morphological_match', 0):.3f}, "
                             f"Embedding: {breakdown.get('embedding', 0):.3f}")
+                
+                # Show raw BM25 score
+                if 'bm25_score' in r:
+                    merged.append(f"  Raw BM25 Score: {r['bm25_score']:.3f}")
             
             merged.append("-"*60)
             
-            # Handle document structure with contexts
+            # Handle document structure with matches
             doc_data = r['document']
-            if isinstance(doc_data, dict) and 'contexts' in doc_data:
+            if isinstance(doc_data, dict) and 'matches' in doc_data:
                 merged.append(f"Total matches: {doc_data['total_matches']}")
                 merged.append(f"File size: {doc_data['file_size']} characters")
                 merged.append("")
                 
-                for j, context in enumerate(doc_data['contexts'], 1):
-                    merged.append(f"Match {j} at line {context['line']}, column {context['column']} ({context['match_type']}):")
-                    merged.append(f"  {context['context']}")
-                    merged.append("")
+                # Group matches by type for cleaner display
+                match_types = {}
+                for match in doc_data['matches']:
+                    match_type = match['match_type']
+                    if match_type not in match_types:
+                        match_types[match_type] = []
+                    match_types[match_type].append(f"line {match['line']}, col {match['column']}")
+                
+                # Display matches grouped by type
+                for match_type, locations in match_types.items():
+                    merged.append(f"{match_type.title()} matches: {', '.join(locations)}")
+                
+                merged.append("")
             else:
                 # Fallback for old format
                 merged.append(str(doc_data))
@@ -1172,6 +1512,8 @@ class Handler(BaseHTTPRequestHandler):
             for i, r in enumerate(res, 1):
                 out.append(f"{i}. {DocumentIndexer._abs(r['metadata']['file_path'])} "
                         f"(sim {r['similarity']:.3f})")
+                if 'bm25_score' in r:
+                    out.append(f"   BM25: {r['bm25_score']:.3f}")
             if res:
                 out.append("\n" + "="*80)
                 out.append("MERGED RESULT")
@@ -1245,9 +1587,12 @@ def main():
                   f"(sim {r['similarity']:.3f})")
             if 'similarity_breakdown' in r:
                 breakdown = r['similarity_breakdown']
-                print(f"   Topic Relevance: {breakdown.get('topic_relevance', 0):.3f}, "
+                print(f"   BM25: {breakdown.get('bm25', 0):.3f}, "
+                      f"Topic Relevance: {breakdown.get('topic_relevance', 0):.3f}, "
                       f"Semantic Distance: {breakdown.get('semantic_distance', 0):.3f}, "
                       f"Morphological: {breakdown.get('morphological_match', 0):.3f}")
+            if 'bm25_score' in r:
+                print(f"   Raw BM25 Score: {r['bm25_score']:.3f}")
         if results:
             print("\n" + "="*80)
             print("MERGED RESULT")
