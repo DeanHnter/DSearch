@@ -279,6 +279,89 @@ def get_synonyms(word: str) -> Set[str]:
         pass
     return synonyms
 
+# Lightweight fuzzy/substring helper to handle typos and partial tokens
+def is_similar(a: str, b: str, threshold: float = 0.82) -> bool:
+    """Return True if strings a and b are close enough (substring or SequenceMatcher).
+
+    - exact equality -> True
+    - substring containment -> True (helps partial tokens like "clas" -> "class")
+    - SequenceMatcher ratio >= threshold -> True (helps small typos like "classs")
+    """
+    if not a or not b:
+        return False
+    a = a.lower().strip()
+    b = b.lower().strip()
+    if a == b:
+        return True
+    # Substring containment handles short partial tokens (e.g. "clas" in "class")
+    # require at least length 3 to avoid matching too aggressively on very short tokens
+    if (len(a) >= 3 and a in b) or (len(b) >= 3 and b in a):
+        return True
+    try:
+        return SequenceMatcher(None, a, b).ratio() >= threshold
+    except Exception:
+        return False
+
+# Small bounded edit-distance check (early-exit, only for short strings).
+def edit_distance_leq(a: str, b: str, max_dist: int = 1) -> bool:
+    """Return True if edit distance between a and b is <= max_dist.
+    Optimized for small max_dist (1 or 2)."""
+    if a == b:
+        return True
+    la, lb = len(a), len(b)
+    # Quick length check
+    if abs(la - lb) > max_dist:
+        return False
+    # Ensure a is the shorter
+    if la > lb:
+        a, b = b, a
+        la, lb = lb, la
+    # If max_dist == 0 handled above (equality)
+    # For max_dist == 1 we can do quick checks
+    if max_dist == 1:
+        # Try deletion/insertion substitution possibilities
+        i = 0
+        j = 0
+        mismatch = 0
+        while i < la and j < lb:
+            if a[i] == b[j]:
+                i += 1
+                j += 1
+            else:
+                mismatch += 1
+                if mismatch > 1:
+                    return False
+                # try skip one char in b (insertion into a / deletion from b)
+                j += 1
+        return True
+    # Fallback to dynamic programming for small strings
+    # classic Levenshtein but bounded
+    dp_prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        dp_cur = [i] + [0] * lb
+        min_row = dp_cur[0]
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            dp_cur[j] = min(dp_prev[j] + 1, dp_cur[j - 1] + 1, dp_prev[j - 1] + cost)
+            if dp_cur[j] < min_row:
+                min_row = dp_cur[j]
+        if min_row > max_dist:
+            return False
+        dp_prev = dp_cur
+    return dp_prev[-1] <= max_dist
+
+
+# Simple correction helper: collapse long runs of the same character to up to two chars.
+# Helps reduce the impact of repeated-letter typos like "classs" -> "class".
+def collapse_repeated_chars(word: str, max_run: int = 2) -> str:
+    if not word:
+        return word
+    # Replace runs of the same character longer than max_run with max_run chars
+    def _repl(m):
+        ch = m.group(1)
+        return ch * max_run
+    return re.sub(r'(.)\1{2,}', _repl, word, flags=re.IGNORECASE)
+
 def extract_key_concepts(text: str) -> Set[str]:
     """Extract key programming and domain concepts from text with morphological awareness"""
     # Programming concepts and keywords (include both singular and plural)
@@ -341,7 +424,7 @@ def extract_key_concepts(text: str) -> Set[str]:
 class BM25:
     """BM25 scoring implementation for lexical matching"""
     
-    def __init__(self, k1: float = 1.5, b: float = 0.75):
+    def __init__(self, k1: float = 1.5, b: float = 0.5):
         self.k1 = k1  # Term frequency saturation parameter
         self.b = b    # Length normalization parameter
         self.corpus = []
@@ -435,62 +518,98 @@ class BM25:
 
 def calculate_morphological_similarity(query_words: List[str], content_words: List[str]) -> float:
     """Calculate similarity considering morphological variations"""
+    # New fuzzy-aware version: count a query-normalized token as matched if any
+    # content-normalized token is sufficiently similar (uses is_similar with a slightly
+    # more permissive threshold to allow for short/partial tokens).
     if not query_words:
         return 0.0
-    
-    # Normalize all words
-    query_normalized = set()
+    # Build normalized token lists (exclude stop words)
+    query_normalized = []
     for word in query_words:
         if word not in programming_stop_words:
-            query_normalized.update(normalize_word(word))
-    
-    content_normalized = set()
+            # also consider a collapsed-version to fix repeated-letter typos
+            query_normalized.extend(normalize_word(word))
+            collapsed = collapse_repeated_chars(word)
+            if collapsed and collapsed != word:
+                query_normalized.extend(normalize_word(collapsed))
+    content_normalized = []
     for word in content_words:
         if word not in programming_stop_words:
-            content_normalized.update(normalize_word(word))
-    
+            content_normalized.extend(normalize_word(word))
+            content_normalized.extend(normalize_word(collapse_repeated_chars(word)))
+    # Deduplicate and filter empties
+    query_normalized = list({w for w in query_normalized if w})
+    content_normalized = list({w for w in content_normalized if w})
     if not query_normalized:
         return 0.0
-    
-    # Calculate overlap
-    intersection = len(query_normalized.intersection(content_normalized))
-    union = len(query_normalized.union(content_normalized))
-    
-    # Jaccard similarity
-    jaccard = intersection / union if union > 0 else 0.0
-    
-    # Coverage (how many query concepts are covered)
-    coverage = intersection / len(query_normalized)
-    
-    # Combine with emphasis on coverage
+    # Count how many query tokens find a fuzzy match in content tokens.
+    # Treat prefix matches and small edit-distance as strong matches for short tokens.
+    matched = 0
+    for q in query_normalized:
+        matched_flag = False
+        for c in content_normalized:
+            # direct fuzzy similarity
+            if is_similar(q, c, threshold=0.75):
+                matched_flag = True
+                break
+            # prefix match (e.g. "clas" -> "class") — require query token length >= 3
+            if len(q) >= 3 and c.startswith(q):
+                matched_flag = True
+                break
+            # small edit distance (allow 1 for short tokens)
+            if edit_distance_leq(q, c, max_dist=1):
+                matched_flag = True
+                break
+        if matched_flag:
+            matched += 1
+    # Approximate intersection and union for a Jaccard-ish score
+    intersection_est = matched
+    union_size = len(set(query_normalized).union(set(content_normalized)))
+    jaccard = intersection_est / union_size if union_size > 0 else 0.0
+    coverage = matched / len(query_normalized) if query_normalized else 0.0
+    # Emphasize coverage (gives better recall for short queries)
     return (jaccard * 0.4) + (coverage * 0.6)
 
 def calculate_concept_overlap(query_concepts: Set[str], content_concepts: Set[str]) -> float:
     """Calculate overlap between concept sets with morphological awareness"""
     if not query_concepts:
         return 0.0
-    
-    # Normalize concepts
-    query_normalized = set()
+    # Fuzzy-aware overlap: treat a query-normalized token as matched when any
+    # content-normalized token is sufficiently similar (substring or fuzzy ratio).
+    query_normalized = []
     for concept in query_concepts:
-        query_normalized.update(normalize_word(concept))
-    
-    content_normalized = set()
+        query_normalized.extend(normalize_word(concept))
+    content_normalized = []
     for concept in content_concepts:
-        content_normalized.update(normalize_word(concept))
-    
-    intersection = len(query_normalized.intersection(content_normalized))
-    
-    if intersection == 0:
+        content_normalized.extend(normalize_word(concept))
+    # Deduplicate and remove empty entries
+    query_normalized = list({w for w in query_normalized if w})
+    content_normalized = list({w for w in content_normalized if w})
+    if not query_normalized or not content_normalized:
         return 0.0
-    
-    # Calculate both Jaccard and coverage
-    union = len(query_normalized.union(content_normalized))
-    jaccard = intersection / union if union > 0 else 0.0
-    coverage = intersection / len(query_normalized)
-    
-    # Emphasize coverage for better recall
-    return (jaccard * 0.3) + (coverage * 0.7)
+    matched = 0
+    for q in query_normalized:
+        matched_flag = False
+        for c in content_normalized:
+            if is_similar(q, c, threshold=0.75):
+                matched_flag = True
+                break
+            # prefix match for short query tokens
+            if len(q) >= 3 and c.startswith(q):
+                matched_flag = True
+                break
+            if edit_distance_leq(q, c, max_dist=1):
+                matched_flag = True
+                break
+        if matched_flag:
+            matched += 1
+    if matched == 0:
+        return 0.0
+    union_size = len(set(query_normalized).union(set(content_normalized)))
+    jaccard = matched / union_size if union_size > 0 else 0.0
+    coverage = matched / len(query_normalized)
+    # Emphasize coverage for recall (same weighting as original design)
+    return (jaccard * 0.3) + (coverage * 0.5)
 
 def extract_topic_keywords(text: str) -> Dict[str, float]:
     """Extract topic-specific keywords with morphological normalization"""
@@ -674,13 +793,15 @@ class BM25EnhancedSimilarity:
     """Advanced similarity calculator with BM25, symbol-awareness, and morphological matching"""
     
     def __init__(self):
+        # Increase weight for morphological/fuzzy lexical signals so typos/partials have more impact.
+        # Keep embeddings relevant but give stronger weight to morphological matching.
         self.weights = {
-            'embedding': 0.12,      # Reduced weight for embedding similarity
-            'bm25': 0.18,           # BM25 lexical matching
-            'topic_relevance': 0.35, # Topic relevance (highest weight)
-            'semantic_distance': 0.20, # Semantic topic distance
-            'morphological_match': 0.10, # Morphological word matching
-            'exact_matches': 0.05   # Exact matches (lowest weight)
+            'embedding': 0.28,
+            'bm25': 0.12,
+            'topic_relevance': 0.18,
+            'semantic_distance': 0.05,
+            'morphological_match': 0.35,
+            'exact_matches': 0.02
         }
         self.bm25 = None
     
@@ -704,8 +825,8 @@ class BM25EnhancedSimilarity:
         # 1. Embedding similarity
         scores['embedding'] = embedding_similarity
         
-        # 2. BM25 lexical matching (normalized to 0-1 range)
-        scores['bm25'] = min(bm25_score / 10.0, 1.0) if bm25_score > 0 else 0.0
+        # 2. BM25 lexical matching (better normalization)
+        scores['bm25'] = min(bm25_score / 5.0, 1.0) if bm25_score > 0 else 0.0
         
         # 3. Topic relevance (high weight, morphologically aware)
         scores['topic_relevance'] = calculate_topic_relevance(query, content)
@@ -723,12 +844,12 @@ class BM25EnhancedSimilarity:
         final_score = sum(scores[component] * self.weights[component] 
                          for component in self.weights.keys())
         
-        # Apply topic mismatch penalty
-        if scores['topic_relevance'] < 0.1 and scores['semantic_distance'] < 0.2:
-            final_score *= 0.2  # Heavy penalty for topic mismatch
+        # Apply topic mismatch penalty (more lenient)
+        if scores['topic_relevance'] < 0.02 and scores['semantic_distance'] < 0.05:
+            final_score *= 0.7  # More lenient penalty for topic mismatch
         
         # Boost if BM25 and morphological matching are both strong
-        if scores['bm25'] > 0.5 and scores['morphological_match'] > 0.7:
+        if scores['bm25'] > 0.5 and scores['morphological_match'] > 0.5:
             final_score *= 1.15  # Boost for strong lexical + morphological matches
         
         scores['final_score'] = min(final_score, 1.0)
@@ -841,39 +962,146 @@ def preprocess_text(text: str, preserve_original: bool = True) -> str:
     
     return ' '.join(processed_tokens)
 
+# --- Fuzzy expansion: augment query with close programming vocab terms to handle typos/partials
+# Small programming vocabulary used to expand likely intended tokens (can be extended)
+PROGRAMMING_VOCAB = {
+    'class', 'classes', 'object', 'objects', 'inheritance', 'polymorphism',
+    'function', 'functions', 'method', 'methods', 'variable', 'variables',
+    'array', 'arrays', 'list', 'lists', 'dictionary', 'dictionaries',
+    'loop', 'loops', 'condition', 'conditions', 'if', 'else', 'while', 'for',
+    'struct', 'structs', 'interface', 'interfaces', 'module', 'modules',
+    'import', 'export', 'package', 'packages', 'library', 'libraries',
+    'type', 'types', 'datatype', 'datatypes', 'string', 'integer', 'boolean',
+    'callback', 'callbacks', 'event', 'events', 'handler', 'handlers',
+    'parameter', 'parameters', 'argument', 'arguments', 'return', 'returns',
+    'create', 'creating', 'define', 'defining', 'declare', 'declaring',
+    'equals', 'assign', 'compare', 'comparison'
+}
+
+
 def enhanced_query_preprocessing(query: str) -> str:
-    """Query preprocessing with symbol awareness and morphological expansion"""
+    """Query preprocessing with symbol awareness, morphological expansion, and fuzzy expansion."""
     if not query:
         return ""
-    
     # Step 1: Apply symbol-aware preprocessing to query
     symbol_processed = separate_symbols_from_words(query)
     operator_processed = normalize_programming_operators(symbol_processed)
-    
     # Add original query
     all_processed = [query.lower(), operator_processed.lower()]
-    
     # Add morphologically processed version
     processed = preprocess_text(operator_processed, preserve_original=True)
     if processed:
         all_processed.append(processed)
-    
     # Add concept-focused expansion with morphological variants
     concepts = extract_key_concepts(operator_processed)
     for concept in concepts:
         all_processed.append(concept)
-        # Add morphological variants
         normalized_forms = normalize_word(concept)
         all_processed.extend(normalized_forms)
-        
-        # Add synonyms for key concepts
         synonyms = get_synonyms(concept)
-        for syn in list(synonyms)[:2]:  # Limit synonyms
+        for syn in list(synonyms)[:2]:
             if len(syn) > 2:
                 all_processed.append(syn)
-    
+    # Fuzzy-expand tokens against known programming vocabulary (fix typos like "classs" or "clas")
+    tokens = set(re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', operator_processed.lower()))
+    for tok in tokens:
+        # skip very short tokens and stop words
+        if len(tok) < 2 or tok in programming_stop_words:
+            continue
+        # Add collapsed variant (handle repeated-letter typos like "classs")
+        collapsed = collapse_repeated_chars(tok)
+        if collapsed and collapsed != tok:
+            all_processed.append(collapsed)
+        # If token is already in vocab, add it directly
+        if tok in PROGRAMMING_VOCAB:
+            all_processed.append(tok)
+            continue
+        # Prefix-based expansion: if tok is a prefix of any vocab term (e.g., "clas" -> "class"),
+        # add that vocab term (require tok length >= 3 to avoid over-matching).
+        if len(tok) >= 3:
+            for vocab_term in PROGRAMMING_VOCAB:
+                if vocab_term.startswith(tok):
+                    all_processed.append(vocab_term)
+                    for nf in normalize_word(vocab_term):
+                        if not nf.startswith('prefix_') and not nf.startswith('suffix_'):
+                            all_processed.append(nf)
+                    for syn in list(get_synonyms(vocab_term))[:2]:
+                        if len(syn) > 2:
+                            all_processed.append(syn)
+        # Fallback: use difflib.get_close_matches to find likely intended vocabulary tokens
+        try:
+            from difflib import get_close_matches
+            close = get_close_matches(tok, PROGRAMMING_VOCAB, n=3, cutoff=0.55)
+        except Exception:
+            close = []
+        for vocab_term in close:
+            all_processed.append(vocab_term)
+            for nf in normalize_word(vocab_term):
+                if not nf.startswith('prefix_') and not nf.startswith('suffix_'):
+                    all_processed.append(nf)
+            for syn in list(get_synonyms(vocab_term))[:2]:
+                if len(syn) > 2:
+                    all_processed.append(syn)
     return ' '.join(all_processed)
 
+
+# ────────────────────────────────────────────────────────────
+# Document chunking
+# ────────────────────────────────────────────────────────────
+
+def create_chunks(text: str, chunk_size: int = 500, overlap: int = 100) -> List[Dict]:
+    """
+    Create chunks from text using fixed-size sliding window strategy.
+    Optimized for mixed documentation and code content.
+    
+    Args:
+        text: Input text to chunk
+        chunk_size: Size of each chunk in characters
+        overlap: Number of characters to overlap between chunks
+        
+    Returns:
+        List of dictionaries with chunk info
+    """
+    if len(text) <= 100:
+        # No chunking needed for short documents
+        return [{"text": text, "chunk_id": 0, "start": 0, "end": len(text)}]
+    
+    chunks = []
+    start = 0
+    chunk_id = 0
+    
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        
+        # Try to break at natural boundaries (sentence/line breaks)
+        if end < len(text):
+            # Look for sentence boundaries first
+            sentence_break = text.rfind('.', start, end)
+            line_break = text.rfind('\n', start, end)
+            
+            # Choose the best break point
+            if sentence_break > start + chunk_size * 0.7:
+                end = sentence_break + 1
+            elif line_break > start + chunk_size * 0.6:
+                end = line_break + 1
+            # Otherwise use the hard boundary
+        
+        chunk_text = text[start:end].strip()
+        if chunk_text:  # Only add non-empty chunks
+            chunks.append({
+                "text": chunk_text,
+                "chunk_id": chunk_id,
+                "start": start,
+                "end": end
+            })
+            chunk_id += 1
+        
+        # Move start position with overlap
+        if end >= len(text):
+            break
+        start = max(start + 1, end - overlap)
+    
+    return chunks
 
 # ────────────────────────────────────────────────────────────
 # document indexer
@@ -934,7 +1162,7 @@ class DocumentIndexer:
         }
     
     def _build_bm25_index(self):
-        """Build BM25 index from current documents"""
+        """Build BM25 index from current documents (full documents, not chunks)"""
         print("Building BM25 index...")
         
         # Get all documents from ChromaDB
@@ -944,28 +1172,39 @@ class DocumentIndexer:
             print("No documents found for BM25 indexing")
             return
         
-        # Prepare corpus for BM25
+        # Prepare corpus for BM25 - use full documents, not chunks
         self.bm25_corpus = []
         self.file_paths = []
+        seen_files = set()
         
         for i, doc in enumerate(all_docs["documents"]):
-            # Get original content for BM25 (not the preprocessed version)
             file_path = all_docs["metadatas"][i].get("file_path", "")
-            original_content = self._get_original_content(file_path)
             
-            if original_content:
-                self.bm25_corpus.append(original_content)
-            else:
+            # Only add each file once to BM25 corpus (not each chunk)
+            if file_path and file_path not in seen_files:
+                seen_files.add(file_path)
+                
+                # Get original full content for BM25 (not the preprocessed version)
+                original_content = self._get_original_content(file_path)
+                
+                if original_content:
+                    self.bm25_corpus.append(original_content)
+                    self.file_paths.append(file_path)
+        
+        # If no full documents found, fallback to using chunks
+        if not self.bm25_corpus:
+            print("No full documents found, using chunks for BM25")
+            for i, doc in enumerate(all_docs["documents"]):
+                file_path = all_docs["metadatas"][i].get("file_path", "")
                 self.bm25_corpus.append(doc)
-            
-            self.file_paths.append(file_path)
+                self.file_paths.append(file_path)
         
         # Build BM25 index
         self.bm25 = BM25()
         self.bm25.fit(self.bm25_corpus)
         self.similarity_calculator.set_bm25(self.bm25)
         
-        print(f"BM25 index built with {len(self.bm25_corpus)} documents")
+        print(f"BM25 index built with {len(self.bm25_corpus)} documents ({len(seen_files)} unique files)")
     
     def sync_with_filesystem(self):
         """Sync the database with the filesystem, checking for changes"""
@@ -1045,11 +1284,16 @@ class DocumentIndexer:
         for file_path in file_paths:
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as fp:
-                    txt = self._clean_content(fp.read())
-                if txt:
-                    documents.append(txt)
-                    metadatas.append(self._store_index_path_metadata(file_path, self.index_path))
+                    content = fp.read()
+                
+                base_metadata = self._store_index_path_metadata(file_path, self.index_path)
+                document_chunks = self._prepare_document_for_storage(content, file_path, base_metadata)
+                
+                for chunk_data in document_chunks:
+                    documents.append(chunk_data["document"])
+                    metadatas.append(chunk_data["metadata"])
                     ids.append(str(uuid.uuid4()))
+                    
             except Exception as e:
                 print(f"Skip {file_path}: {e}")
         
@@ -1086,6 +1330,42 @@ class DocumentIndexer:
         # Combine representations
         return ' '.join(representations)
 
+    def _prepare_document_for_storage(self, content: str, file_path: str, base_metadata: dict) -> List[Dict]:
+        """Prepare document for storage, creating chunks if needed"""
+        cleaned_content = self._clean_content(content)
+        
+        # Check if document needs chunking (>100 characters)
+        if len(content) <= 100:
+            # Store as single document
+            return [{
+                "document": cleaned_content,
+                "metadata": {**base_metadata, "is_chunked": False, "chunk_id": 0, "total_chunks": 1},
+                "original_content": content
+            }]
+        
+        # Create chunks from original content
+        chunks = create_chunks(content)
+        documents_to_store = []
+        
+        for chunk in chunks:
+            chunk_cleaned = self._clean_content(chunk["text"])
+            chunk_metadata = {
+                **base_metadata,
+                "is_chunked": True,
+                "chunk_id": chunk["chunk_id"],
+                "total_chunks": len(chunks),
+                "chunk_start": chunk["start"],
+                "chunk_end": chunk["end"]
+            }
+            
+            documents_to_store.append({
+                "document": chunk_cleaned,
+                "metadata": chunk_metadata,
+                "original_content": chunk["text"]
+            })
+        
+        return documents_to_store
+
     def _supported(self):                                                   # noqa
         return ('.txt', '.md', '.mdx', '.yaml', '.yml', '.json', '.py', '.js',
                 '.html', '.css', '.yaka')
@@ -1102,19 +1382,25 @@ class DocumentIndexer:
                     try:
                         p = os.path.abspath(os.path.join(root, f))
                         with open(p, 'r', encoding='utf-8', errors='ignore') as fp:
-                            txt = self._clean_content(fp.read())
-                        if txt:
-                            documents.append(txt)
-                            metadatas.append(self._store_index_path_metadata(p, directory))
+                            content = fp.read()
+                        
+                        base_metadata = self._store_index_path_metadata(p, directory)
+                        document_chunks = self._prepare_document_for_storage(content, p, base_metadata)
+                        
+                        for chunk_data in document_chunks:
+                            documents.append(chunk_data["document"])
+                            metadatas.append(chunk_data["metadata"])
                             ids.append(str(uuid.uuid4()))
-                        print("Indexed", p)
+                        
+                        chunk_count = len(document_chunks)
+                        print(f"Indexed {p} ({chunk_count} chunks)")
                     except Exception as e:
                         print("Skip", f, e)
         if documents:
             self.collection.add(documents=documents,
                                 metadatas=metadatas,
                                 ids=ids)
-            print("Added", len(documents), "documents")
+            print("Added", len(documents), "document chunks")
             
             # Build BM25 index after adding documents
             self._build_bm25_index()
@@ -1134,16 +1420,21 @@ class DocumentIndexer:
         with open(path, 'w', encoding='utf-8') as fp:
             fp.write(text)
 
-        metadata = self._store_index_path_metadata(path, self.index_path)
-        metadata["title"] = title or ""
-        metadata["size"] = len(text)  # Override with actual content size
+        base_metadata = self._store_index_path_metadata(path, self.index_path)
+        base_metadata["title"] = title or ""
+        base_metadata["size"] = len(text)  # Override with actual content size
 
-        self.collection.add(
-            documents=[text],
-            metadatas=[metadata],
-            ids=[str(uuid.uuid4())]
-        )
-        print("Saved & indexed", path)
+        document_chunks = self._prepare_document_for_storage(text, path, base_metadata)
+        
+        documents, metadatas, ids = [], [], []
+        for chunk_data in document_chunks:
+            documents.append(chunk_data["document"])
+            metadatas.append(chunk_data["metadata"])
+            ids.append(str(uuid.uuid4()))
+
+        self.collection.add(documents=documents, metadatas=metadatas, ids=ids)
+        chunk_count = len(document_chunks)
+        print(f"Saved & indexed {path} ({chunk_count} chunks)")
         
         # Rebuild BM25 index after adding document
         self._build_bm25_index()
@@ -1214,6 +1505,11 @@ class DocumentIndexer:
         filtered_results = [r for r in unique_results if r['similarity'] >= thr]
         final_results = filtered_results[:n]
         
+        # Debug: show similarity scores
+        if unique_results:
+            print(f"Debug: Top 3 similarity scores: {[r['similarity'] for r in unique_results[:3]]}")
+            print(f"Debug: Threshold applied: {thr}")
+        
         print(f"Final results: {len(final_results)} (after BM25-enhanced reranking and threshold {thr})")
         return final_results
     
@@ -1241,30 +1537,36 @@ class DocumentIndexer:
         
         return results
     
-    def _deduplicate_and_rerank_bm25_enhanced(self, results: List[Dict], query: str, threshold: float) -> List[Dict]:
-        """Remove duplicates and rerank using BM25-enhanced similarity"""
-        # Group by file path to remove duplicates
-        file_results = {}
+    def _aggregate_chunks_to_documents(self, results: List[Dict], query: str) -> List[Dict]:
+        """Aggregate chunk results back to document-level results"""
+        # Group results by file path
+        file_groups = {}
         for result in results:
             file_path = result['metadata'].get('file_path', '')
-            if file_path not in file_results or result['embedding_similarity'] > file_results[file_path]['embedding_similarity']:
-                file_results[file_path] = result
+            if file_path not in file_groups:
+                file_groups[file_path] = []
+            file_groups[file_path].append(result)
         
-        # Calculate BM25-enhanced similarity for each unique result
-        bm25_results = []
-        for result in file_results.values():
-            # Get original content for better similarity calculation
-            file_path = result['metadata'].get('file_path', '')
+        aggregated_results = []
+        
+        for file_path, chunks in file_groups.items():
+            # Find the best chunk for this document
+            best_chunk = max(chunks, key=lambda x: x['embedding_similarity'])
+            
+            # Calculate combined score from all chunks
+            chunk_scores = [chunk['embedding_similarity'] for chunk in chunks]
+            max_score = max(chunk_scores)
+            avg_score = sum(chunk_scores) / len(chunk_scores)
+            
+            # Use weighted combination: 70% best chunk + 30% average of all chunks
+            combined_embedding_score = (max_score * 0.7) + (avg_score * 0.3)
+            
+            # Get full document content for similarity calculation
             original_content = self._get_original_content(file_path)
             if not original_content:
-                # Fallback to basic content if available
-                doc_data = result['document']
-                if isinstance(doc_data, dict) and 'file_size' in doc_data:
-                    original_content = ""  # Use empty string as fallback
-                else:
-                    original_content = str(doc_data)
+                original_content = str(best_chunk['document'])
             
-            # Calculate BM25 score
+            # Calculate BM25 score using full document
             bm25_score = 0.0
             if self.bm25 and file_path in self.file_paths:
                 try:
@@ -1273,22 +1575,46 @@ class DocumentIndexer:
                 except (ValueError, IndexError):
                     bm25_score = 0.0
             
-            # Calculate BM25-enhanced similarity
+            # Calculate BM25-enhanced similarity using full document
             similarity_scores = self.similarity_calculator.calculate_similarity(
-                query, original_content, result['embedding_similarity'], bm25_score
+                query, original_content, combined_embedding_score, bm25_score
             )
             
-            # Update result with BM25-enhanced scores
-            result['similarity'] = similarity_scores['final_score']
-            result['similarity_breakdown'] = similarity_scores
-            result['bm25_score'] = bm25_score
+            # Create aggregated result
+            aggregated_result = {
+                "document": original_content,
+                "metadata": best_chunk['metadata'].copy(),
+                "embedding_similarity": combined_embedding_score,
+                "similarity": similarity_scores['final_score'],
+                "similarity_breakdown": similarity_scores,
+                "bm25_score": bm25_score,
+                "original_query": query,
+                "chunk_count": len(chunks),
+                "matching_chunks": len(chunks)
+            }
             
-            bm25_results.append(result)
+            # Remove chunk-specific metadata for document-level result
+            if 'chunk_id' in aggregated_result['metadata']:
+                del aggregated_result['metadata']['chunk_id']
+            if 'chunk_start' in aggregated_result['metadata']:
+                del aggregated_result['metadata']['chunk_start']
+            if 'chunk_end' in aggregated_result['metadata']:
+                del aggregated_result['metadata']['chunk_end']
+            aggregated_result['metadata']['is_chunked'] = len(chunks) > 1
+            
+            aggregated_results.append(aggregated_result)
         
-        # Sort by BM25-enhanced similarity
-        bm25_results.sort(key=lambda x: x['similarity'], reverse=True)
+        # Sort by final similarity score
+        aggregated_results.sort(key=lambda x: x['similarity'], reverse=True)
         
-        return bm25_results
+        return aggregated_results
+
+    def _deduplicate_and_rerank_bm25_enhanced(self, results: List[Dict], query: str, threshold: float) -> List[Dict]:
+        """Remove duplicates and rerank using BM25-enhanced similarity with chunk aggregation"""
+        # First aggregate chunks back to documents
+        aggregated_results = self._aggregate_chunks_to_documents(results, query)
+        
+        return aggregated_results
     
     def _get_original_content(self, file_path: str) -> str:
         """Get original file content for similarity calculation"""
@@ -1365,8 +1691,8 @@ class DocumentIndexer:
         
         return contexts
     
-    def _get_display_content(self, doc_content: str, file_path: str, query: str = None) -> Dict:
-        """Get match information with line/column details only"""
+    def _get_display_content(self, doc_content: str, file_path: str, query: str = None) -> str:
+        """Get full document content"""
         if file_path and os.path.exists(file_path):
             try:
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as fp:
@@ -1374,29 +1700,11 @@ class DocumentIndexer:
                 # Clean but don't preprocess for display
                 original_content = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', original_content)
                 original_content = original_content.replace('\r\n', '\n').replace('\r', '\n').strip()
-                content = original_content
+                return original_content
             except Exception:
-                content = doc_content
+                return doc_content
         else:
-            content = doc_content
-        
-        # If we have a query, find matches and return match info only
-        if query:
-            matches = self._find_match_positions(content, query)
-            contexts = self._get_context_around_matches(content, matches)
-            
-            return {
-                'matches': contexts,
-                'total_matches': len(matches),
-                'file_size': len(content)
-            }
-        else:
-            # Fallback: return basic info if no query
-            return {
-                'matches': [],
-                'total_matches': 0,
-                'file_size': len(content)
-            }
+            return doc_content
 
     def merge_results(self, results: List[Dict]) -> str:
         if not results:
@@ -1404,7 +1712,13 @@ class DocumentIndexer:
         merged = []
         for i, r in enumerate(results, 1):
             merged.append("\n" + "="*60)
-            merged.append(f"DOC {i}: {self._abs(r['metadata']['file_path'])} "
+            
+            # Show chunk information if available
+            chunk_info = ""
+            if 'chunk_count' in r and r['chunk_count'] > 1:
+                chunk_info = f" ({r['chunk_count']} chunks)"
+            
+            merged.append(f"DOC {i}: {self._abs(r['metadata']['file_path'])}{chunk_info} "
                         f"(sim {r['similarity']:.3f})")
             
             # Show BM25-enhanced similarity breakdown
@@ -1420,31 +1734,17 @@ class DocumentIndexer:
                 if 'bm25_score' in r:
                     merged.append(f"  Raw BM25 Score: {r['bm25_score']:.3f}")
             
+            # Show chunking information
+            if 'chunk_count' in r:
+                merged.append(f"  Chunks: {r['chunk_count']} total, {r.get('matching_chunks', r['chunk_count'])} matched")
+            
             merged.append("-"*60)
             
-            # Handle document structure with matches
-            doc_data = r['document']
-            if isinstance(doc_data, dict) and 'matches' in doc_data:
-                merged.append(f"Total matches: {doc_data['total_matches']}")
-                merged.append(f"File size: {doc_data['file_size']} characters")
-                merged.append("")
-                
-                # Group matches by type for cleaner display
-                match_types = {}
-                for match in doc_data['matches']:
-                    match_type = match['match_type']
-                    if match_type not in match_types:
-                        match_types[match_type] = []
-                    match_types[match_type].append(f"line {match['line']}, col {match['column']}")
-                
-                # Display matches grouped by type
-                for match_type, locations in match_types.items():
-                    merged.append(f"{match_type.title()} matches: {', '.join(locations)}")
-                
-                merged.append("")
-            else:
-                # Fallback for old format
-                merged.append(str(doc_data))
+            # Add full document content
+            doc_content = r['document']
+            merged.append(str(doc_content))
+            merged.append("")
+            
         return "\n".join(merged)
 
 # ────────────────────────────────────────────────────────────
@@ -1503,7 +1803,7 @@ class Handler(BaseHTTPRequestHandler):
         if not query:
             return self.send_json_response({"error": "q missing"}, 400)
         n      = int(q.get('max_results', [self.config.get('max_results', 5)])[0])
-        thr    = float(q.get('threshold',  [self.config.get('similarity_threshold', 0.7)])[0])
+        thr    = float(q.get('threshold',  [self.config.get('similarity_threshold', 0.5)])[0])
         fmt    = q.get('format', ['json'])[0]
 
         res    = self.indexer.search(query, n, thr)
@@ -1550,7 +1850,7 @@ def main():
     p.add_argument("--collection", default="documents")
     p.add_argument("--index-path", default="./documents")
     p.add_argument("--max-results", type=int, default=5)
-    p.add_argument("--similarity-threshold", type=float, default=0.7)
+    p.add_argument("--similarity-threshold", type=float, default=0.1)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     server_parser = sub.add_parser("server")
